@@ -27,6 +27,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -36,6 +37,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <queue>
 #include <set>
 #include <string>
 #include <thread>
@@ -205,14 +207,80 @@ static bool IsCloneLockFileName(const std::string& name) {
 }
 
 // Copies a single file, overwriting the destination.
-// Returns number of bytes copied, or -1 on error.
+//
+// Uses CreateFileW with FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE so
+// we can read files that the browser holds open with an exclusive lock (Cookies,
+// Session_*, Tabs_*, cache.db, etc.).  Falls back to fs::copy_file on any open
+// failure so we never regress on normal files.
+//
+// Returns bytes copied on success, -1 on error.
 static int64_t ForceCopyFile(const fs::path& src, const fs::path& dst) {
-    try {
-        fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
-        return (int64_t)fs::file_size(dst);
-    } catch (...) {
+    // Open source with full share flags — bypasses browser's exclusive lock.
+    HANDLE hSrc = CreateFileW(
+        src.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+        nullptr);
+
+    if (hSrc == INVALID_HANDLE_VALUE) {
+        // Fallback: try the standard path (works for non-locked files).
+        try {
+            fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
+            return (int64_t)fs::file_size(dst);
+        } catch (...) {
+            return -1;
+        }
+    }
+
+    // Get file size for return value.
+    LARGE_INTEGER fileSize{};
+    GetFileSizeEx(hSrc, &fileSize);
+
+    // Open/create destination (truncate if exists).
+    HANDLE hDst = CreateFileW(
+        dst.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+        nullptr);
+
+    if (hDst == INVALID_HANDLE_VALUE) {
+        CloseHandle(hSrc);
         return -1;
     }
+
+    // Stream copy in 1 MB chunks.
+    static constexpr DWORD kBufSize = 1 << 20; // 1 MB
+    std::vector<char> buf(kBufSize);
+    int64_t totalWritten = 0;
+    bool ok = true;
+
+    while (ok) {
+        DWORD bytesRead = 0;
+        if (!ReadFile(hSrc, buf.data(), kBufSize, &bytesRead, nullptr)) { ok = false; break; }
+        if (bytesRead == 0) break; // EOF
+
+        DWORD bytesWritten = 0;
+        if (!WriteFile(hDst, buf.data(), bytesRead, &bytesWritten, nullptr) ||
+            bytesWritten != bytesRead) {
+            ok = false; break;
+        }
+        totalWritten += bytesWritten;
+    }
+
+    CloseHandle(hSrc);
+    CloseHandle(hDst);
+
+    if (!ok) {
+        DeleteFileW(dst.c_str()); // Remove partial file.
+        return -1;
+    }
+    return totalWritten;
 }
 
 static const std::set<std::string> BASE_SKIP_DIRS = {
@@ -364,26 +432,81 @@ static std::string CloneBrowserProfile(
 
     Log("cloning %zu files to %s", jobs.size(), cloneBase.string().c_str());
 
-    // Create destination directories
+    // Create all destination directories up front (must be serial).
     std::set<fs::path> dirs;
     for (auto& j : jobs) dirs.insert(j.dst.parent_path());
     for (auto& d : dirs) fs::create_directories(d, ec);
 
-    // Copy with simple retry (mirrors Go: 3 attempts, 750ms delay)
-    int64_t failed = 0;
-    for (auto& job : jobs) {
-        bool ok = false;
-        for (int attempt = 0; attempt < 3; ++attempt) {
-            if (attempt > 0) std::this_thread::sleep_for(std::chrono::milliseconds(750));
-            if (ForceCopyFile(job.src, job.dst) >= 0) { ok = true; break; }
-        }
-        if (!ok) {
-            ++failed;
-            Log("warning: could not copy %s after retries",
-                job.src.filename().string().c_str());
-        }
-    }
+    // ---------------------------------------------------------------------------
+    // Parallel copy: thread pool — saturates NVMe queue depth for small files.
+    // 16 workers is the sweet spot for a local SSD with thousands of KB-range
+    // files; the OS I/O scheduler merges requests efficiently at this concurrency.
+    // ---------------------------------------------------------------------------
+    static constexpr int kWorkers = 16;
 
+    std::queue<const CopyJob*> workQueue;
+    std::mutex                 queueMu;
+    std::condition_variable    queueCv;   // wakes workers when jobs arrive / shutdown
+    std::condition_variable    doneCv;    // wakes main when all work is finished
+    std::atomic<int64_t>       failedCount{0};
+    int                        inFlight = 0; // jobs popped but not yet finished (guarded by queueMu)
+    bool                       shutdown = false;
+
+    for (auto& j : jobs) workQueue.push(&j);
+
+    auto worker = [&]() {
+        for (;;) {
+            const CopyJob* job = nullptr;
+            {
+                std::unique_lock<std::mutex> lk(queueMu);
+                queueCv.wait(lk, [&]{ return !workQueue.empty() || shutdown; });
+                if (workQueue.empty()) return; // shutdown && empty → exit
+                job = workQueue.front();
+                workQueue.pop();
+                ++inFlight;
+            }
+
+            // 3 attempts, 200ms between retries.
+            // Retry delay is shorter — with share-mode open, locked-file errors
+            // are handled at the handle level; retries now only cover transient I/O.
+            bool ok = false;
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                if (attempt > 0)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                if (ForceCopyFile(job->src, job->dst) >= 0) { ok = true; break; }
+            }
+            if (!ok) {
+                ++failedCount;
+                Log("warning: could not copy %s after retries",
+                    job->src.filename().string().c_str());
+            }
+
+            {
+                std::unique_lock<std::mutex> lk(queueMu);
+                --inFlight;
+                if (workQueue.empty() && inFlight == 0)
+                    doneCv.notify_one(); // tell main all work is done
+            }
+        }
+    };
+
+    // Spawn workers then wake them.
+    std::vector<std::thread> threads;
+    threads.reserve(kWorkers);
+    for (int i = 0; i < kWorkers; ++i)
+        threads.emplace_back(worker);
+    queueCv.notify_all();
+
+    // Wait until queue is empty AND no job is still executing.
+    {
+        std::unique_lock<std::mutex> lk(queueMu);
+        doneCv.wait(lk, [&]{ return workQueue.empty() && inFlight == 0; });
+        shutdown = true;
+    }
+    queueCv.notify_all(); // wake blocked workers so they exit
+    for (auto& t : threads) t.join();
+
+    int64_t failed = failedCount.load();
     if (failed > 0)
         Log("clone finished with %lld skipped files", (long long)failed);
     else
