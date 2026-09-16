@@ -1,0 +1,91 @@
+name: Build (MSVC x64)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build BackstageLauncher (MSVC x64)
+    runs-on: windows-latest
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout
+      # -----------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 2. Set up MSVC environment via the official VS developer shell action
+      # -----------------------------------------------------------------------
+      - name: Set up MSVC developer shell
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Add MSVC to PATH via vcvars
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
+            call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+          )
+          echo PATH=%PATH% >> %GITHUB_ENV%
+          echo INCLUDE=%INCLUDE% >> %GITHUB_ENV%
+          echo LIB=%LIB% >> %GITHUB_ENV%
+          echo LIBPATH=%LIBPATH% >> %GITHUB_ENV%
+
+      # -----------------------------------------------------------------------
+      # 3. Compile
+      # -----------------------------------------------------------------------
+      - name: Compile BackstageLauncher.exe
+        shell: cmd
+        run: |
+          call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > vsinstall.tmp
+          set /p VSINSTALL=<vsinstall.tmp
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+
+          cl.exe ^
+            /std:c++20 ^
+            /EHsc ^
+            /O2 ^
+            /W3 ^
+            /D NDEBUG ^
+            /D WIN32_LEAN_AND_MEAN ^
+            /D NOMINMAX ^
+            /D _UNICODE ^
+            /D UNICODE ^
+            /Fe:BackstageLauncher.exe ^
+            src\main.cpp ^
+            /link ^
+            kernel32.lib ^
+            advapi32.lib ^
+            psapi.lib ^
+            shell32.lib ^
+            user32.lib ^
+            /SUBSYSTEM:CONSOLE ^
+            /MACHINE:X64
+
+      # -----------------------------------------------------------------------
+      # 4. Quick sanity check
+      # -----------------------------------------------------------------------
+      - name: Verify output
+        shell: cmd
+        run: |
+          if not exist BackstageLauncher.exe (
+            echo ERROR: BackstageLauncher.exe not found
+            exit /b 1
+          )
+          echo Build succeeded.
+          dir BackstageLauncher.exe
+
+      # -----------------------------------------------------------------------
+      # 5. Upload artifact
+      # -----------------------------------------------------------------------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BackstageLauncher-x64
+          path: BackstageLauncher.exe
+          retention-days: 30
