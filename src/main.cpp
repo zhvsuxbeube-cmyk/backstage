@@ -21,6 +21,7 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <shlobj.h>
+#include <shellapi.h>   // ShellExecuteExA, SHELLEXECUTEINFOA, SEE_MASK_NOCLOSEPROCESS
 #include <winternl.h>   // UNICODE_STRING, OBJECT_ATTRIBUTES
 
 #include <algorithm>
@@ -61,8 +62,10 @@ namespace fs = std::filesystem;
 #define SystemHandleInformation 0x10        // info class 16
 #define ObjectTypeInformation   2
 #define ObjectNameInformation   1
-#define NT_SUCCESS(s)           ((NTSTATUS)(s) >= 0)
+// NT_SUCCESS is already defined in winternl.h; do not redefine it.
+#ifndef STATUS_INFO_LENGTH_MISMATCH
 #define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
+#endif
 
 typedef struct _SYSTEM_HANDLE {
     ULONG      ProcessId;
