@@ -21,6 +21,7 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <shlobj.h>
+#include <winternl.h>   // UNICODE_STRING, OBJECT_ATTRIBUTES
 
 #include <algorithm>
 #include <array>
@@ -43,7 +44,141 @@
 #include <thread>
 #include <vector>
 
+#pragma comment(lib, "shell32.lib")
+// ntdll.lib is NOT linked — NtQuerySystemInformation and NtQueryObject are
+// resolved dynamically via GetProcAddress(GetModuleHandleA("ntdll.dll"), ...)
+// since they are undocumented/semi-documented exports without stable import lib support.
+
 namespace fs = std::filesystem;
+
+// ---------------------------------------------------------------------------
+// NT native API: handle enumeration for unlocking exclusively-held files
+// ---------------------------------------------------------------------------
+// These structures are undocumented but stable since NT 4 / Win2k.
+// Dynamically resolved from ntdll.dll so we never need to link ntdll.lib
+// for undocumented exports.
+
+#define SystemHandleInformation 0x10        // info class 16
+#define ObjectTypeInformation   2
+#define ObjectNameInformation   1
+#define NT_SUCCESS(s)           ((NTSTATUS)(s) >= 0)
+#define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
+
+typedef struct _SYSTEM_HANDLE {
+    ULONG      ProcessId;
+    UCHAR      ObjectTypeNumber;
+    UCHAR      Flags;
+    USHORT     Handle;
+    PVOID      Object;
+    ACCESS_MASK GrantedAccess;
+} SYSTEM_HANDLE;
+
+typedef struct _SYSTEM_HANDLE_INFORMATION {
+    ULONG         HandleCount;
+    SYSTEM_HANDLE Handles[1];
+} SYSTEM_HANDLE_INFORMATION, *PSYSTEM_HANDLE_INFORMATION;
+
+// PUBLIC_OBJECT_TYPE_INFORMATION — first field is a UNICODE_STRING TypeName.
+// winternl.h does not define this so no guard needed.
+typedef struct _BS_OBJECT_TYPE_INFORMATION {
+    UNICODE_STRING TypeName;
+    ULONG          Reserved[22];
+} BS_OBJECT_TYPE_INFORMATION, *PBS_OBJECT_TYPE_INFORMATION;
+
+// OBJECT_NAME_INFORMATION — contains a UNICODE_STRING Name.
+// winternl.h declares OBJECT_NAME_INFORMATION but may omit the NameBuffer
+// flexible member.  Define our own with a distinct name to stay safe.
+typedef struct _BS_OBJECT_NAME_INFORMATION {
+    UNICODE_STRING Name;
+    WCHAR          NameBuffer[1];
+} BS_OBJECT_NAME_INFORMATION, *PBS_OBJECT_NAME_INFORMATION;
+
+typedef NTSTATUS (NTAPI *PNtQuerySystemInformation)(
+    ULONG  SystemInformationClass,
+    PVOID  SystemInformation,
+    ULONG  SystemInformationLength,
+    PULONG ReturnLength);
+
+typedef NTSTATUS (NTAPI *PNtQueryObject)(
+    HANDLE Handle,
+    ULONG  ObjectInformationClass,
+    PVOID  ObjectInformation,
+    ULONG  ObjectInformationLength,
+    PULONG ReturnLength);
+
+// Resolve once, lazily.
+static PNtQuerySystemInformation g_NtQuerySystemInformation = nullptr;
+static PNtQueryObject            g_NtQueryObject            = nullptr;
+
+static void EnsureNtdllFuncs() {
+    if (g_NtQuerySystemInformation) return;
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll) return;
+    g_NtQuerySystemInformation = (PNtQuerySystemInformation)
+        GetProcAddress(ntdll, "NtQuerySystemInformation");
+    g_NtQueryObject = (PNtQueryObject)
+        GetProcAddress(ntdll, "NtQueryObject");
+}
+
+// ---------------------------------------------------------------------------
+// Admin check + UAC re-launch helpers
+// ---------------------------------------------------------------------------
+
+// Returns true if the current process token has the Administrators group
+// enabled (i.e. we are already elevated on Vista+, or running as admin on XP).
+static bool IsRunningAsAdmin() {
+    BOOL isAdmin = FALSE;
+    PSID adminSid = nullptr;
+    SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&ntAuth, 2,
+            SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+            0, 0, 0, 0, 0, 0, &adminSid)) {
+        CheckTokenMembership(nullptr, adminSid, &isAdmin);
+        FreeSid(adminSid);
+    }
+    return isAdmin != FALSE;
+}
+
+// Re-launch this same executable with "runas" verb (triggers UAC prompt).
+// Passes the original command line arguments through verbatim.
+// Returns true if ShellExecuteEx succeeded (the elevated process was started).
+static bool RelaunchAsAdmin(int argc, char* argv[]) {
+    char selfPath[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, selfPath, MAX_PATH);
+
+    // Re-assemble argv[1..] into a single argument string.
+    std::string params;
+    for (int i = 1; i < argc; ++i) {
+        if (i > 1) params += ' ';
+        // Wrap each token in quotes to handle spaces.
+        params += '"';
+        params += argv[i];
+        params += '"';
+    }
+
+    SHELLEXECUTEINFOA sei = {};
+    sei.cbSize       = sizeof(sei);
+    sei.fMask        = SEE_MASK_NOCLOSEPROCESS;
+    sei.hwnd         = nullptr;
+    sei.lpVerb       = "runas";
+    sei.lpFile       = selfPath;
+    sei.lpParameters = params.empty() ? nullptr : params.c_str();
+    sei.nShow        = SW_SHOWNORMAL;
+
+    if (!ShellExecuteExA(&sei)) {
+        DWORD err = GetLastError();
+        if (err == ERROR_CANCELLED) {
+            fprintf(stderr, "UAC prompt cancelled by user.\n");
+        } else {
+            fprintf(stderr, "ShellExecuteEx(runas) failed: %lu\n", err);
+        }
+        return false;
+    }
+
+    // We don't wait for the elevated child; just exit this non-elevated copy.
+    if (sei.hProcess) CloseHandle(sei.hProcess);
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -210,15 +345,229 @@ static bool IsCloneLockFileName(const std::string& name) {
     return lower == "lock" || lower == "lockfile" || lower == "parent.lock";
 }
 
+// ---------------------------------------------------------------------------
+// Handle-duplication unlock
+// ---------------------------------------------------------------------------
+//
+// When SeBackupPrivilege is unavailable (non-admin run), Chrome/Brave hold
+// Cookies, Session_*, Tabs_*, cache.db* exclusively (FILE_SHARE_NONE).
+// We can break that lock from user mode by:
+//   1. Enumerating all system handles via NtQuerySystemInformation.
+//   2. For each handle owned by a browser process, duplicating it into our
+//      process to resolve its NT path via NtQueryObject.
+//   3. If the path matches our target file, calling DuplicateHandle a second
+//      time with DUPLICATE_CLOSE_SOURCE — this atomically closes the handle
+//      in the owner process, releasing the exclusive lock.
+//   4. We then immediately close our copy of the handle.
+//
+// Requires: OpenProcess(PROCESS_DUP_HANDLE) on the owning process, which
+// itself requires either admin/SeDebugPrivilege or the same-user + same-IL
+// condition.  Returns the number of handles closed (0 = lock not released).
+//
+// Safety notes:
+//   - We query ObjectTypeInformation first and skip non-File handles.
+//     NtQueryObject on named-pipe handles to disconnected peers can block
+//     indefinitely, so the type check is essential.
+//   - We never touch handles in PID 4 (System) or PID 0.
+//   - After closing the browser's handle the browser may reopen it; this is
+//     fine — we copy immediately after calling this function.
+
+static int UnlockFileHandles(const fs::path& targetPath) {
+    EnsureNtdllFuncs();
+    if (!g_NtQuerySystemInformation || !g_NtQueryObject) return 0;
+
+    // -----------------------------------------------------------------------
+    // Step 1: Convert the Win32 path to its NT device path
+    //         (e.g. C:\Users\... -> \Device\HarddiskVolume3\Users\...)
+    // We do this by resolving the drive letter via QueryDosDevice.
+    // -----------------------------------------------------------------------
+    std::wstring win32Path = targetPath.wstring();
+
+    // Extract drive letter (e.g. "C:")
+    std::wstring ntPath;
+    if (win32Path.size() >= 2 && win32Path[1] == L':') {
+        wchar_t drive[3] = { win32Path[0], L':', L'\0' };
+        wchar_t devicePath[512] = {};
+        if (QueryDosDeviceW(drive, devicePath, 512)) {
+            ntPath = std::wstring(devicePath) + win32Path.substr(2);
+        }
+    }
+    if (ntPath.empty()) {
+        // Fallback: use the Win32 path with case-insensitive compare.
+        ntPath = win32Path;
+    }
+
+    // Lowercase for comparison
+    std::wstring ntPathLow = ntPath;
+    std::transform(ntPathLow.begin(), ntPathLow.end(), ntPathLow.begin(), ::towlower);
+
+    // -----------------------------------------------------------------------
+    // Step 2: Enumerate all open handles in the system
+    // -----------------------------------------------------------------------
+    ULONG bufSize = 1 << 20; // start at 1 MB, double on mismatch
+    std::vector<BYTE> buf(bufSize);
+    NTSTATUS status;
+    for (;;) {
+        status = g_NtQuerySystemInformation(SystemHandleInformation,
+                                            buf.data(), (ULONG)buf.size(),
+                                            &bufSize);
+        if (status == STATUS_INFO_LENGTH_MISMATCH) {
+            buf.resize((size_t)bufSize + (1 << 16));
+            continue;
+        }
+        break;
+    }
+    if (!NT_SUCCESS(status)) return 0;
+
+    auto* info = reinterpret_cast<PSYSTEM_HANDLE_INFORMATION>(buf.data());
+    int closed = 0;
+
+    // We cache process handles by PID to avoid re-opening the same process
+    // for every handle it owns.
+    std::map<ULONG, HANDLE> procHandleCache;
+    auto getProc = [&](ULONG pid) -> HANDLE {
+        auto it = procHandleCache.find(pid);
+        if (it != procHandleCache.end()) return it->second;
+        HANDLE h = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
+        procHandleCache[pid] = h; // may be nullptr on failure
+        return h;
+    };
+
+    // Scratch buffers for NtQueryObject
+    std::vector<BYTE> typeBuf(512);
+    std::vector<BYTE> nameBuf(2048);
+
+    for (ULONG i = 0; i < info->HandleCount; ++i) {
+        const SYSTEM_HANDLE& sh = info->Handles[i];
+
+        // Skip System/Idle PIDs
+        if (sh.ProcessId == 0 || sh.ProcessId == 4) continue;
+
+        HANDLE hProc = getProc(sh.ProcessId);
+        if (!hProc) continue;
+
+        // -----------------------------------------------------------------------
+        // Step 3: Duplicate the handle into our process so we can query it.
+        //         Use DUPLICATE_SAME_ACCESS with 0 desired access so we get
+        //         whatever access the owner had.
+        // -----------------------------------------------------------------------
+        HANDLE hDup = nullptr;
+        if (!DuplicateHandle(hProc, (HANDLE)(ULONG_PTR)sh.Handle,
+                             GetCurrentProcess(), &hDup,
+                             0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            continue;
+        }
+
+        // -----------------------------------------------------------------------
+        // Step 4: Check the object type — skip anything that isn't "File".
+        //         This avoids blocking on named pipes / sockets.
+        // -----------------------------------------------------------------------
+        ULONG typeRet = 0;
+        status = g_NtQueryObject(hDup, ObjectTypeInformation,
+                                 typeBuf.data(), (ULONG)typeBuf.size(),
+                                 &typeRet);
+        if (!NT_SUCCESS(status)) {
+            CloseHandle(hDup);
+            continue;
+        }
+        auto* typeInfo = reinterpret_cast<PBS_OBJECT_TYPE_INFORMATION>(typeBuf.data());
+        // TypeName.Buffer is a counted string (not necessarily null-terminated)
+        std::wstring typeName(typeInfo->TypeName.Buffer,
+                              typeInfo->TypeName.Length / sizeof(wchar_t));
+        if (typeName != L"File") {
+            CloseHandle(hDup);
+            continue;
+        }
+
+        // -----------------------------------------------------------------------
+        // Step 5: Query the NT object name (full path).
+        // -----------------------------------------------------------------------
+        ULONG nameRet = 0;
+        status = g_NtQueryObject(hDup, ObjectNameInformation,
+                                 nameBuf.data(), (ULONG)nameBuf.size(),
+                                 &nameRet);
+        if (!NT_SUCCESS(status) || nameRet < sizeof(BS_OBJECT_NAME_INFORMATION)) {
+            CloseHandle(hDup);
+            continue;
+        }
+        auto* nameInfo = reinterpret_cast<PBS_OBJECT_NAME_INFORMATION>(nameBuf.data());
+        if (!nameInfo->Name.Buffer || nameInfo->Name.Length == 0) {
+            CloseHandle(hDup);
+            continue;
+        }
+
+        std::wstring objName(nameInfo->Name.Buffer,
+                             nameInfo->Name.Length / sizeof(wchar_t));
+        std::wstring objNameLow = objName;
+        std::transform(objNameLow.begin(), objNameLow.end(),
+                       objNameLow.begin(), ::towlower);
+
+        CloseHandle(hDup); // done with the read copy
+
+        // -----------------------------------------------------------------------
+        // Step 6: Does this handle point to our target file?
+        //         Compare both the NT device path AND a bare filename suffix
+        //         in case the drive mapping didn't resolve.
+        // -----------------------------------------------------------------------
+        bool match = (objNameLow == ntPathLow);
+        if (!match) {
+            // Fallback: compare just the filename portion case-insensitively.
+            std::wstring targetFileLow = targetPath.filename().wstring();
+            std::transform(targetFileLow.begin(), targetFileLow.end(),
+                           targetFileLow.begin(), ::towlower);
+            // objName must END with \<filename> to count (not a partial match).
+            if (objNameLow.size() >= targetFileLow.size() + 1) {
+                size_t pos = objNameLow.size() - targetFileLow.size();
+                if (objNameLow[pos - 1] == L'\\' &&
+                    objNameLow.substr(pos) == targetFileLow) {
+                    match = true;
+                }
+            }
+        }
+
+        if (!match) continue;
+
+        // -----------------------------------------------------------------------
+        // Step 7: Close the handle in the owner process.
+        //         DuplicateHandle with DUPLICATE_CLOSE_SOURCE + NULL target
+        //         process closes the source and does not create a copy for us.
+        // -----------------------------------------------------------------------
+        HANDLE dummy = nullptr;
+        if (DuplicateHandle(hProc, (HANDLE)(ULONG_PTR)sh.Handle,
+                            GetCurrentProcess(), &dummy,
+                            0, FALSE,
+                            DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS)) {
+            // Close the copy that landed in our process.
+            if (dummy) CloseHandle(dummy);
+            ++closed;
+            Log("handle-unlock: closed handle 0x%X in PID %lu for %s",
+                sh.Handle, sh.ProcessId,
+                targetPath.filename().string().c_str());
+        }
+    }
+
+    // Close cached process handles
+    for (auto& [pid, h] : procHandleCache)
+        if (h) CloseHandle(h);
+
+    return closed;
+}
+
 // Copies a single file, overwriting the destination.
 //
 // Chrome (v104+) and Brave hold Cookies, Session_*, Tabs_*, cache.db* open
 // with dwShareMode=0 — a full exclusive deny-all lock.  No share flags on our
-// CreateFileW call can override the first opener's lock; the only user-mode
-// bypass is SeBackupPrivilege + FILE_FLAG_BACKUP_SEMANTICS, which tells the
-// kernel I/O manager to skip the share-mode compatibility check when the
-// caller holds backup privilege.  We enable that privilege in main() before
-// the clone starts, so every ForceCopyFile call here benefits automatically.
+// CreateFileW call can override the first opener's lock.
+//
+// When running as admin, the SeBackupPrivilege path (FILE_FLAG_BACKUP_SEMANTICS)
+// bypasses the share-mode check entirely and we never need to touch the browser's
+// handles.
+//
+// When NOT running as admin, SeBackupPrivilege cannot be enabled, so we fall
+// back to the handle-duplication unlock: enumerate all open handles via
+// NtQuerySystemInformation, find every handle pointing to this file, and
+// close each one in its owner process via DuplicateHandle(DUPLICATE_CLOSE_SOURCE).
+// After that the file is no longer locked and a plain CreateFile succeeds.
 //
 // Returns bytes copied on success, -1 on error.
 static int64_t ForceCopyFile(const fs::path& src, const fs::path& dst) {
@@ -235,12 +584,30 @@ static int64_t ForceCopyFile(const fs::path& src, const fs::path& dst) {
         nullptr);
 
     if (hSrc == INVALID_HANDLE_VALUE) {
-        // Last resort: standard copy (works for files not held exclusively).
-        try {
-            fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
-            return (int64_t)fs::file_size(dst);
-        } catch (...) {
-            return -1;
+        // Backup-semantics open failed (likely no SeBackupPrivilege / not admin).
+        // Try the handle-duplication unlock: find every open handle to this file
+        // in any process and close them via DuplicateHandle(DUPLICATE_CLOSE_SOURCE).
+        int unlocked = UnlockFileHandles(src);
+        if (unlocked > 0) {
+            // Retry the open now that the exclusive lock is gone.
+            hSrc = CreateFileW(
+                src.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_FLAG_SEQUENTIAL_SCAN,
+                nullptr);
+        }
+
+        if (hSrc == INVALID_HANDLE_VALUE) {
+            // Last resort: standard copy (works for files not held exclusively).
+            try {
+                fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
+                return (int64_t)fs::file_size(dst);
+            } catch (...) {
+                return -1;
+            }
         }
     }
 
@@ -1203,6 +1570,53 @@ static void PrintUsage(const char* argv0) {
 }
 
 int main(int argc, char* argv[]) {
+    // -----------------------------------------------------------------------
+    // Admin check — must come before everything else.
+    //
+    // SeDebugPrivilege (injection) and SeBackupPrivilege (bypassing exclusive
+    // file locks held by browsers) are only available when the process is
+    // elevated.  Without them:
+    //   • Injection into some browser processes may fail.
+    //   • Exclusively-locked files (Cookies, Session_*, Tabs_*, cache.db*)
+    //     fall back to the handle-duplication unlock, which is slower and
+    //     may fail if the browser process is protected.
+    //
+    // We therefore detect the elevation state up front and offer to relaunch
+    // via ShellExecuteEx "runas" (UAC prompt) when not admin.
+    // -----------------------------------------------------------------------
+    if (!IsRunningAsAdmin()) {
+        std::cout <<
+            "[backstage] WARNING: not running as administrator.\n"
+            "[backstage]   Without admin privileges:\n"
+            "[backstage]     - SeBackupPrivilege is unavailable; exclusively-locked\n"
+            "[backstage]       browser files (Cookies, Session_*, Tabs_*, cache.db*)\n"
+            "[backstage]       will be unlocked via handle duplication instead.\n"
+            "[backstage]     - SeDebugPrivilege is unavailable; injection may fail\n"
+            "[backstage]       if the browser process is protected.\n"
+            "[backstage]\n"
+            "Relaunch as administrator for full functionality? [Y/N]: ";
+        std::cout.flush();
+
+        std::string answer;
+        std::getline(std::cin, answer);
+        // Trim whitespace
+        while (!answer.empty() && (answer.front() == ' ' || answer.front() == '\t'))
+            answer.erase(answer.begin());
+
+        if (!answer.empty() && (answer[0] == 'Y' || answer[0] == 'y')) {
+            if (RelaunchAsAdmin(argc, argv)) {
+                // Elevated child is now running; exit this unelevated copy.
+                return 0;
+            }
+            // RelaunchAsAdmin printed the error; fall through and continue
+            // without elevation so the user still gets partial functionality.
+            std::cout << "[backstage] Continuing without administrator privileges.\n";
+        } else {
+            std::cout << "[backstage] Continuing without administrator privileges.\n";
+        }
+        std::cout << "\n";
+    }
+
     // Locate the DLL beside this executable by default
     char selfPath[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, selfPath, MAX_PATH);
