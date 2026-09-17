@@ -193,7 +193,7 @@ static void Log(const char* fmt, ...) {
     char buf[2048];
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    std::cout << "[backstage] " << buf << "\n";
+    std::cout << "[DEBUG] " << buf << "\n";
     std::cout.flush();
 }
 
@@ -852,15 +852,29 @@ static std::string CloneBrowserProfile(
     // Parallel copy: thread pool — saturates NVMe queue depth for small files.
     // 16 workers is the sweet spot for a local SSD with thousands of KB-range
     // files; the OS I/O scheduler merges requests efficiently at this concurrency.
+    //
+    // Design notes:
+    //   - `pending` is initialised to jobs.size() before any thread starts.
+    //     Each worker decrements it after finishing a job and signals doneCv
+    //     when it hits zero.  This means doneCv fires correctly even if all
+    //     work completes before the main thread reaches its wait().
+    //   - Workers are spawned AFTER queueCv.notify_all() has been called and
+    //     after the shutdown flag / queue are fully initialised, eliminating
+    //     the race where a worker calls wait() after the only notify_all().
+    //   - shutdown is set to true before the final notify_all() so workers
+    //     that wake up and find an empty queue exit cleanly.
     // ---------------------------------------------------------------------------
     static constexpr int kWorkers = 16;
 
     std::queue<const CopyJob*> workQueue;
     std::mutex                 queueMu;
-    std::condition_variable    queueCv;   // wakes workers when jobs arrive / shutdown
-    std::condition_variable    doneCv;    // wakes main when all work is finished
+    std::condition_variable    queueCv;  // wakes workers when jobs arrive / shutdown
+    std::condition_variable    doneCv;   // wakes main when all work is finished
     std::atomic<int64_t>       failedCount{0};
-    int                        inFlight = 0; // jobs popped but not yet finished (guarded by queueMu)
+    // `pending` counts jobs not yet completed (popped AND processed).
+    // Initialised to total job count so doneCv fires correctly even if all
+    // work finishes before main reaches its wait().
+    size_t                     pending = jobs.size();
     bool                       shutdown = false;
 
     for (auto& j : jobs) workQueue.push(&j);
@@ -874,12 +888,11 @@ static std::string CloneBrowserProfile(
                 if (workQueue.empty()) return; // shutdown && empty → exit
                 job = workQueue.front();
                 workQueue.pop();
-                ++inFlight;
             }
 
-            // 3 attempts, 200ms between retries.
-            // Retry delay is shorter — with share-mode open, locked-file errors
-            // are handled at the handle level; retries now only cover transient I/O.
+            // 3 attempts, 200 ms between retries.
+            // Locked-file errors are handled by the pre-unlock pass;
+            // retries here cover only transient I/O failures.
             bool ok = false;
             for (int attempt = 0; attempt < 3; ++attempt) {
                 if (attempt > 0)
@@ -894,27 +907,34 @@ static std::string CloneBrowserProfile(
 
             {
                 std::unique_lock<std::mutex> lk(queueMu);
-                --inFlight;
-                if (workQueue.empty() && inFlight == 0)
-                    doneCv.notify_one(); // tell main all work is done
+                if (--pending == 0)
+                    doneCv.notify_one(); // all jobs done — wake main thread
             }
         }
     };
 
-    // Spawn workers then wake them.
+    // Spawn workers. All state (queue, flags) is fully initialised before
+    // threads start, so there is no window where a worker can miss a signal.
     std::vector<std::thread> threads;
     threads.reserve(kWorkers);
     for (int i = 0; i < kWorkers; ++i)
         threads.emplace_back(worker);
+
+    // Wake all workers now that threads exist and are listening.
     queueCv.notify_all();
 
-    // Wait until queue is empty AND no job is still executing.
+    // Wait until every job has been completed (pending == 0).
+    if (!jobs.empty()) {
+        std::unique_lock<std::mutex> lk(queueMu);
+        doneCv.wait(lk, [&]{ return pending == 0; });
+    }
+
+    // Signal workers to exit and join them.
     {
         std::unique_lock<std::mutex> lk(queueMu);
-        doneCv.wait(lk, [&]{ return workQueue.empty() && inFlight == 0; });
         shutdown = true;
     }
-    queueCv.notify_all(); // wake blocked workers so they exit
+    queueCv.notify_all();
     for (auto& t : threads) t.join();
 
     int64_t failed = failedCount.load();
@@ -1624,35 +1644,26 @@ int main(int argc, char* argv[]) {
     // -----------------------------------------------------------------------
     if (!IsRunningAsAdmin()) {
         std::cout <<
-            "[backstage] WARNING: not running as administrator.\n"
-            "[backstage]   Without admin privileges:\n"
-            "[backstage]     - SeBackupPrivilege is unavailable; exclusively-locked\n"
-            "[backstage]       browser files (Cookies, Session_*, Tabs_*, cache.db*)\n"
-            "[backstage]       will be unlocked via handle duplication instead.\n"
-            "[backstage]     - SeDebugPrivilege is unavailable; injection may fail\n"
-            "[backstage]       if the browser process is protected.\n"
-            "[backstage]\n"
-            "Relaunch as administrator for full functionality? [Y/N]: ";
+            "[DEBUG] Not running as administrator.\n"
+            "[DEBUG]   Locked browser files will use handle duplication (slower).\n"
+            "[DEBUG]   Injection may fail if the browser process is protected.\n"
+            "\n"
+            "Relaunch as administrator? [Y/N]: ";
         std::cout.flush();
 
         std::string answer;
         std::getline(std::cin, answer);
-        // Trim whitespace
         while (!answer.empty() && (answer.front() == ' ' || answer.front() == '\t'))
             answer.erase(answer.begin());
 
         if (!answer.empty() && (answer[0] == 'Y' || answer[0] == 'y')) {
             if (RelaunchAsAdmin(argc, argv)) {
-                // Elevated child is now running; exit this unelevated copy.
                 return 0;
             }
-            // RelaunchAsAdmin printed the error; fall through and continue
-            // without elevation so the user still gets partial functionality.
-            std::cout << "[backstage] Continuing without administrator privileges.\n";
+            std::cout << "[DEBUG] Continuing without administrator privileges.\n\n";
         } else {
-            std::cout << "[backstage] Continuing without administrator privileges.\n";
+            std::cout << "[DEBUG] Continuing without administrator privileges.\n\n";
         }
-        std::cout << "\n";
     }
 
     // Locate the DLL beside this executable by default
