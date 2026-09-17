@@ -587,30 +587,16 @@ static int64_t ForceCopyFile(const fs::path& src, const fs::path& dst) {
         nullptr);
 
     if (hSrc == INVALID_HANDLE_VALUE) {
-        // Backup-semantics open failed (likely no SeBackupPrivilege / not admin).
-        // Try the handle-duplication unlock: find every open handle to this file
-        // in any process and close them via DuplicateHandle(DUPLICATE_CLOSE_SOURCE).
-        int unlocked = UnlockFileHandles(src);
-        if (unlocked > 0) {
-            // Retry the open now that the exclusive lock is gone.
-            hSrc = CreateFileW(
-                src.c_str(),
-                GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                nullptr,
-                OPEN_EXISTING,
-                FILE_FLAG_SEQUENTIAL_SCAN,
-                nullptr);
-        }
-
-        if (hSrc == INVALID_HANDLE_VALUE) {
-            // Last resort: standard copy (works for files not held exclusively).
-            try {
-                fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
-                return (int64_t)fs::file_size(dst);
-            } catch (...) {
-                return -1;
-            }
+        // Backup-semantics open failed (no SeBackupPrivilege / not admin).
+        // Handle-unlock was already done in bulk before the parallel copy
+        // started (UnlockAllProfileHandles), so the lock should be gone.
+        // Plain copy_file is the fallback for any file that is still held
+        // or simply needs no special treatment.
+        try {
+            fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
+            return (int64_t)fs::file_size(dst);
+        } catch (...) {
+            return -1;
         }
     }
 
@@ -738,6 +724,47 @@ static void CollectDirFiles(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bulk handle unlock — called ONCE before the parallel copy workers start.
+//
+// UnlockFileHandles() does a full system-wide NtQuerySystemInformation pass.
+// Calling it from 16 worker threads simultaneously causes severe kernel-level
+// contention (every thread races to DuplicateHandle into/out of the same
+// remote processes) and stalls all workers indefinitely, deadlocking the
+// doneCv.wait in CloneBrowserProfile.
+//
+// The correct pattern is a single serial pass over all collected copy jobs
+// before the thread pool starts.  We build the set of unique source paths
+// that fail a quick open attempt (i.e. are actually exclusively locked), then
+// call UnlockFileHandles once per locked file.  After this function returns
+// every job should be openable by a plain CreateFileW.
+// ---------------------------------------------------------------------------
+static void UnlockAllProfileHandles(const std::vector<CopyJob>& jobs) {
+    for (const auto& job : jobs) {
+        // Quick probe: try to open with the same flags ForceCopyFile uses.
+        // If it succeeds the file is not exclusively locked — skip it.
+        HANDLE h = CreateFileW(
+            job.src.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_SEQUENTIAL_SCAN,
+            nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            CloseHandle(h);
+            continue; // not locked
+        }
+
+        // File is locked — close all handles pointing to it.
+        int n = UnlockFileHandles(job.src);
+        if (n > 0) {
+            Log("handle-unlock: released %d handle(s) on %s",
+                n, job.src.filename().string().c_str());
+        }
+    }
+}
+
 // Full profile clone. Returns the clone directory, or empty on error.
 static std::string CloneBrowserProfile(
     const BrowserInfo& info,
@@ -812,6 +839,14 @@ static std::string CloneBrowserProfile(
     std::set<fs::path> dirs;
     for (auto& j : jobs) dirs.insert(j.dst.parent_path());
     for (auto& d : dirs) fs::create_directories(d, ec);
+
+    // ---------------------------------------------------------------------------
+    // Pre-unlock: single serial pass to release exclusive handles BEFORE the
+    // parallel workers start.  Doing this inside ForceCopyFile (called from
+    // 16 threads simultaneously) causes kernel-level handle-table contention
+    // that stalls all workers and deadlocks the doneCv.wait below.
+    // ---------------------------------------------------------------------------
+    UnlockAllProfileHandles(jobs);
 
     // ---------------------------------------------------------------------------
     // Parallel copy: thread pool — saturates NVMe queue depth for small files.
