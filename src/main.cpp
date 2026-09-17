@@ -22,7 +22,7 @@
 #include <psapi.h>
 #include <shlobj.h>
 #include <shellapi.h>   // ShellExecuteExA, SHELLEXECUTEINFOA, SEE_MASK_NOCLOSEPROCESS
-#include <winternl.h>   // UNICODE_STRING, OBJECT_ATTRIBUTES
+#include <restartmanager.h> // RmStartSession, RmGetList, etc.
 
 #include <algorithm>
 #include <array>
@@ -46,55 +46,44 @@
 #include <vector>
 
 #pragma comment(lib, "shell32.lib")
-// ntdll.lib is NOT linked — NtQuerySystemInformation and NtQueryObject are
-// resolved dynamically via GetProcAddress(GetModuleHandleA("ntdll.dll"), ...)
-// since they are undocumented/semi-documented exports without stable import lib support.
+#pragma comment(lib, "rstrtmgr.lib")
+// ntdll.lib is NOT linked — NtQuerySystemInformation is resolved dynamically
+// via GetProcAddress since it is undocumented and has no stable import lib.
 
 namespace fs = std::filesystem;
 
 // ---------------------------------------------------------------------------
-// NT native API: handle enumeration for unlocking exclusively-held files
+// NT native API: SystemExtendedHandleInformation (class 64)
 // ---------------------------------------------------------------------------
-// These structures are undocumented but stable since NT 4 / Win2k.
-// Dynamically resolved from ntdll.dll so we never need to link ntdll.lib
-// for undocumented exports.
+// Used only for the per-file hijack copy path (locked-file fallback).
+// Resolved dynamically from ntdll.dll.
 
-#define SystemHandleInformation 0x10        // info class 16
-#define ObjectTypeInformation   2
-#define ObjectNameInformation   1
-// NT_SUCCESS is already defined in winternl.h; do not redefine it.
 #ifndef STATUS_INFO_LENGTH_MISMATCH
 #define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
 #endif
 
-typedef struct _SYSTEM_HANDLE {
-    ULONG      ProcessId;
-    UCHAR      ObjectTypeNumber;
-    UCHAR      Flags;
-    USHORT     Handle;
-    PVOID      Object;
-    ACCESS_MASK GrantedAccess;
-} SYSTEM_HANDLE;
+// SystemExtendedHandleInformation (class 64) — returns 64-bit-safe handle
+// entries and includes UniqueProcessId as a proper ULONG_PTR.
+#define SystemExtendedHandleInformation 64
 
-typedef struct _SYSTEM_HANDLE_INFORMATION {
-    ULONG         HandleCount;
-    SYSTEM_HANDLE Handles[1];
-} SYSTEM_HANDLE_INFORMATION, *PSYSTEM_HANDLE_INFORMATION;
+// One entry from the SystemExtendedHandleInformation array.
+typedef struct _SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX {
+    PVOID       Object;
+    ULONG_PTR   UniqueProcessId;
+    ULONG_PTR   HandleValue;
+    ULONG       GrantedAccess;
+    USHORT      CreatorBackTraceIndex;
+    USHORT      ObjectTypeIndex;
+    ULONG       HandleAttributes;
+    ULONG       Reserved;
+} SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX;
 
-// PUBLIC_OBJECT_TYPE_INFORMATION — first field is a UNICODE_STRING TypeName.
-// winternl.h does not define this so no guard needed.
-typedef struct _BS_OBJECT_TYPE_INFORMATION {
-    UNICODE_STRING TypeName;
-    ULONG          Reserved[22];
-} BS_OBJECT_TYPE_INFORMATION, *PBS_OBJECT_TYPE_INFORMATION;
-
-// OBJECT_NAME_INFORMATION — contains a UNICODE_STRING Name.
-// winternl.h declares OBJECT_NAME_INFORMATION but may omit the NameBuffer
-// flexible member.  Define our own with a distinct name to stay safe.
-typedef struct _BS_OBJECT_NAME_INFORMATION {
-    UNICODE_STRING Name;
-    WCHAR          NameBuffer[1];
-} BS_OBJECT_NAME_INFORMATION, *PBS_OBJECT_NAME_INFORMATION;
+// Header for the SystemExtendedHandleInformation buffer.
+typedef struct _SYSTEM_HANDLE_INFORMATION_EX {
+    ULONG_PTR                       NumberOfHandles;
+    ULONG_PTR                       Reserved;
+    SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX Handles[1];
+} SYSTEM_HANDLE_INFORMATION_EX, *PSYSTEM_HANDLE_INFORMATION_EX;
 
 typedef NTSTATUS (NTAPI *PNtQuerySystemInformation)(
     ULONG  SystemInformationClass,
@@ -102,16 +91,7 @@ typedef NTSTATUS (NTAPI *PNtQuerySystemInformation)(
     ULONG  SystemInformationLength,
     PULONG ReturnLength);
 
-typedef NTSTATUS (NTAPI *PNtQueryObject)(
-    HANDLE Handle,
-    ULONG  ObjectInformationClass,
-    PVOID  ObjectInformation,
-    ULONG  ObjectInformationLength,
-    PULONG ReturnLength);
-
-// Resolve once, lazily.
 static PNtQuerySystemInformation g_NtQuerySystemInformation = nullptr;
-static PNtQueryObject            g_NtQueryObject            = nullptr;
 
 static void EnsureNtdllFuncs() {
     if (g_NtQuerySystemInformation) return;
@@ -119,8 +99,6 @@ static void EnsureNtdllFuncs() {
     if (!ntdll) return;
     g_NtQuerySystemInformation = (PNtQuerySystemInformation)
         GetProcAddress(ntdll, "NtQuerySystemInformation");
-    g_NtQueryObject = (PNtQueryObject)
-        GetProcAddress(ntdll, "NtQueryObject");
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +308,11 @@ static std::map<std::string, std::string> CheckInstalledBrowsers() {
 // Profile clone helpers
 // ---------------------------------------------------------------------------
 
+static std::string ToLower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    return s;
+}
+
 static bool IsFirefoxProfileDir(const std::string& name) {
     std::string lower = name;
     std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
@@ -349,300 +332,264 @@ static bool IsCloneLockFileName(const std::string& name) {
 }
 
 // ---------------------------------------------------------------------------
-// Handle-duplication unlock
+// Restart Manager helpers — identify which PIDs hold a lock on a file
 // ---------------------------------------------------------------------------
-//
-// When SeBackupPrivilege is unavailable (non-admin run), Chrome/Brave hold
-// Cookies, Session_*, Tabs_*, cache.db* exclusively (FILE_SHARE_NONE).
-// We can break that lock from user mode by:
-//   1. Enumerating all system handles via NtQuerySystemInformation.
-//   2. For each handle owned by a browser process, duplicating it into our
-//      process to resolve its NT path via NtQueryObject.
-//   3. If the path matches our target file, calling DuplicateHandle a second
-//      time with DUPLICATE_CLOSE_SOURCE — this atomically closes the handle
-//      in the owner process, releasing the exclusive lock.
-//   4. We then immediately close our copy of the handle.
-//
-// Requires: OpenProcess(PROCESS_DUP_HANDLE) on the owning process, which
-// itself requires either admin/SeDebugPrivilege or the same-user + same-IL
-// condition.  Returns the number of handles closed (0 = lock not released).
-//
-// Safety notes:
-//   - We query ObjectTypeInformation first and skip non-File handles.
-//     NtQueryObject on named-pipe handles to disconnected peers can block
-//     indefinitely, so the type check is essential.
-//   - We never touch handles in PID 4 (System) or PID 0.
-//   - After closing the browser's handle the browser may reopen it; this is
-//     fine — we copy immediately after calling this function.
+// RmStartSession / RmGetList (from restartmanager.h + rstrtmgr.lib) let us
+// ask the OS exactly which processes have a file open, without scanning every
+// handle in the system.  We use this to pre-filter the handle scan.
 
-static int UnlockFileHandles(const fs::path& targetPath) {
-    EnsureNtdllFuncs();
-    if (!g_NtQuerySystemInformation || !g_NtQueryObject) return 0;
+// Returns the PIDs of all processes that have `filePath` open.
+// Returns empty vector if Restart Manager is unavailable or the file is not locked.
+static std::vector<DWORD> GetLockingPIDs(const std::wstring& filePath) {
 
-    // -----------------------------------------------------------------------
-    // Step 1: Convert the Win32 path to its NT device path
-    //         (e.g. C:\Users\... -> \Device\HarddiskVolume3\Users\...)
-    // We do this by resolving the drive letter via QueryDosDevice.
-    // -----------------------------------------------------------------------
-    std::wstring win32Path = targetPath.wstring();
+    // Build a session key from the last 8 chars of the path (avoids long-name limits)
+    std::wstring key = L"bsl_";
+    if (filePath.size() > 8)
+        key += filePath.substr(filePath.size() - 8);
+    else
+        key += filePath;
 
-    // Extract drive letter (e.g. "C:")
-    std::wstring ntPath;
-    if (win32Path.size() >= 2 && win32Path[1] == L':') {
-        wchar_t drive[3] = { win32Path[0], L':', L'\0' };
-        wchar_t devicePath[512] = {};
-        if (QueryDosDeviceW(drive, devicePath, 512)) {
-            ntPath = std::wstring(devicePath) + win32Path.substr(2);
+    DWORD session = 0;
+    if (RmStartSession(&session, 0, key.data()) != ERROR_SUCCESS)
+        return {};
+
+    LPCWSTR paths[1] = { filePath.c_str() };
+    RmRegisterResources(session, 1, paths, 0, nullptr, 0, nullptr);
+
+    UINT needed = 0, count = 0;
+    DWORD reason = 0;
+    DWORD rc = RmGetList(session, &needed, &count, nullptr, &reason);
+
+    std::vector<DWORD> pids;
+    if (rc == ERROR_MORE_DATA && needed > 0) {
+        std::vector<RM_PROCESS_INFO> infos(needed);
+        count = needed;
+        if (RmGetList(session, &needed, &count, infos.data(), &reason) == ERROR_SUCCESS) {
+            for (UINT i = 0; i < count; ++i)
+                pids.push_back(infos[i].Process.dwProcessId);
         }
     }
-    if (ntPath.empty()) {
-        // Fallback: use the Win32 path with case-insensitive compare.
-        ntPath = win32Path;
+
+    RmEndSession(session);
+    return pids;
+}
+
+// ---------------------------------------------------------------------------
+// Handle hijack copy
+// ---------------------------------------------------------------------------
+// When a file is exclusively locked (share-mode 0) by the browser we cannot
+// open it ourselves.  Instead we:
+//   1. Use Restart Manager to learn exactly which PIDs hold the lock.
+//   2. Enumerate system handles (SystemExtendedHandleInformation, class 64)
+//      filtering to only those PIDs.
+//   3. For each handle, duplicate it into our process and verify the path
+//      with GetFinalPathNameByHandleW (clean Win32 API — no NtQueryObject,
+//      no named-pipe blocking risk).
+//   4. Read from the duplicated handle and write to dst.
+//
+// We NEVER close the browser's handle (DUPLICATE_CLOSE_SOURCE).  The browser
+// keeps its handle; we read a snapshot of the file through our duplicate.
+//
+// Returns bytes copied on success, -1 on error.
+
+static bool IsFileLocked(DWORD err) {
+    return err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION;
+}
+
+// Copy src → dst reading through an already-duplicated handle.
+static int64_t CopyThroughHandle(HANDLE hSrc, const fs::path& dst) {
+    HANDLE hDst = CreateFileW(
+        dst.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (hDst == INVALID_HANDLE_VALUE) return -1;
+
+    static constexpr DWORD kBuf = 1 << 20; // 1 MB
+    std::vector<char> buf(kBuf);
+    int64_t total = 0;
+    bool ok = true;
+
+    // Seek to start — duplicated handles may inherit the owner's file pointer.
+    LARGE_INTEGER zero{};
+    SetFilePointerEx(hSrc, zero, nullptr, FILE_BEGIN);
+
+    while (ok) {
+        DWORD nr = 0, nw = 0;
+        if (!ReadFile(hSrc, buf.data(), kBuf, &nr, nullptr)) { ok = false; break; }
+        if (nr == 0) break;
+        if (!WriteFile(hDst, buf.data(), nr, &nw, nullptr) || nw != nr) { ok = false; break; }
+        total += nw;
     }
 
-    // Lowercase for comparison
-    std::wstring ntPathLow = ntPath;
-    std::transform(ntPathLow.begin(), ntPathLow.end(), ntPathLow.begin(), ::towlower);
+    CloseHandle(hDst);
+    if (!ok) { DeleteFileW(dst.c_str()); return -1; }
+    return total;
+}
 
-    // -----------------------------------------------------------------------
-    // Step 2: Enumerate all open handles in the system
-    // -----------------------------------------------------------------------
-    ULONG bufSize = 1 << 20; // start at 1 MB, double on mismatch
+// Duplicate a readable handle to `targetPath` from any locking process.
+// Returns the duplicated handle (caller must CloseHandle it), or INVALID_HANDLE_VALUE.
+static HANDLE DuplicateLockedFileHandle(const fs::path& targetPath,
+                                        const std::vector<DWORD>& lockingPids)
+{
+    EnsureNtdllFuncs();
+    if (!g_NtQuerySystemInformation) return INVALID_HANDLE_VALUE;
+
+    // Build normalized target path for comparison (lowercase, canonical slashes).
+    std::wstring target = targetPath.wstring();
+    std::transform(target.begin(), target.end(), target.begin(), ::towlower);
+
+    // Enumerate all handles via SystemExtendedHandleInformation (class 64).
+    // This is the 64-bit-safe variant used by the Go reference implementation.
+    ULONG bufSize = 1 << 20;
     std::vector<BYTE> buf(bufSize);
-    NTSTATUS status;
     for (;;) {
-        status = g_NtQuerySystemInformation(SystemHandleInformation,
-                                            buf.data(), (ULONG)buf.size(),
-                                            &bufSize);
-        if (status == STATUS_INFO_LENGTH_MISMATCH) {
-            buf.resize((size_t)bufSize + (1 << 16));
+        ULONG ret = 0;
+        NTSTATUS st = g_NtQuerySystemInformation(
+            SystemExtendedHandleInformation,
+            buf.data(), (ULONG)buf.size(), &ret);
+        if (st == STATUS_INFO_LENGTH_MISMATCH) {
+            buf.resize((size_t)ret + 4096);
             continue;
         }
+        if (st != 0) return INVALID_HANDLE_VALUE;
         break;
     }
-    if (!NT_SUCCESS(status)) return 0;
 
-    auto* info = reinterpret_cast<PSYSTEM_HANDLE_INFORMATION>(buf.data());
-    int closed = 0;
+    auto* hdr = reinterpret_cast<SYSTEM_HANDLE_INFORMATION_EX*>(buf.data());
+    ULONG_PTR count = hdr->NumberOfHandles;
 
-    // We cache process handles by PID to avoid re-opening the same process
-    // for every handle it owns.
-    std::map<ULONG, HANDLE> procHandleCache;
-    auto getProc = [&](ULONG pid) -> HANDLE {
-        auto it = procHandleCache.find(pid);
-        if (it != procHandleCache.end()) return it->second;
+    // Cache open process handles keyed by PID.
+    std::map<DWORD, HANDLE> procCache;
+    auto getProc = [&](DWORD pid) -> HANDLE {
+        auto it = procCache.find(pid);
+        if (it != procCache.end()) return it->second;
         HANDLE h = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
-        procHandleCache[pid] = h; // may be nullptr on failure
+        procCache[pid] = h;
         return h;
     };
 
-    // Scratch buffers for NtQueryObject
-    std::vector<BYTE> typeBuf(512);
-    std::vector<BYTE> nameBuf(2048);
+    HANDLE result = INVALID_HANDLE_VALUE;
 
-    for (ULONG i = 0; i < info->HandleCount; ++i) {
-        const SYSTEM_HANDLE& sh = info->Handles[i];
+    for (ULONG_PTR i = 0; i < count && result == INVALID_HANDLE_VALUE; ++i) {
+        auto& e = hdr->Handles[i];
+        DWORD pid = (DWORD)e.UniqueProcessId;
 
-        // Skip System/Idle PIDs
-        if (sh.ProcessId == 0 || sh.ProcessId == 4) continue;
+        // Filter to known locking PIDs when available.
+        if (!lockingPids.empty()) {
+            bool found = false;
+            for (DWORD lp : lockingPids) { if (lp == pid) { found = true; break; } }
+            if (!found) continue;
+        } else {
+            if (pid == 0 || pid == 4) continue; // skip System/Idle
+        }
 
-        HANDLE hProc = getProc(sh.ProcessId);
+        HANDLE hProc = getProc(pid);
         if (!hProc) continue;
 
-        // -----------------------------------------------------------------------
-        // Step 3: Duplicate the handle into our process so we can query it.
-        //         Use DUPLICATE_SAME_ACCESS with 0 desired access so we get
-        //         whatever access the owner had.
-        // -----------------------------------------------------------------------
         HANDLE hDup = nullptr;
-        if (!DuplicateHandle(hProc, (HANDLE)(ULONG_PTR)sh.Handle,
+        if (!DuplicateHandle(hProc, (HANDLE)e.HandleValue,
                              GetCurrentProcess(), &hDup,
-                             0, FALSE, DUPLICATE_SAME_ACCESS)) {
-            continue;
-        }
+                             0, FALSE, DUPLICATE_SAME_ACCESS)) continue;
 
-        // -----------------------------------------------------------------------
-        // Step 4: Check the object type — skip anything that isn't "File".
-        //         This avoids blocking on named pipes / sockets.
-        // -----------------------------------------------------------------------
-        ULONG typeRet = 0;
-        status = g_NtQueryObject(hDup, ObjectTypeInformation,
-                                 typeBuf.data(), (ULONG)typeBuf.size(),
-                                 &typeRet);
-        if (!NT_SUCCESS(status)) {
-            CloseHandle(hDup);
-            continue;
-        }
-        auto* typeInfo = reinterpret_cast<PBS_OBJECT_TYPE_INFORMATION>(typeBuf.data());
-        // TypeName.Buffer is a counted string (not necessarily null-terminated)
-        std::wstring typeName(typeInfo->TypeName.Buffer,
-                              typeInfo->TypeName.Length / sizeof(wchar_t));
-        if (typeName != L"File") {
-            CloseHandle(hDup);
-            continue;
-        }
+        // Use GetFileType to quickly skip non-disk handles (no blocking risk).
+        if (GetFileType(hDup) != FILE_TYPE_DISK) { CloseHandle(hDup); continue; }
 
-        // -----------------------------------------------------------------------
-        // Step 5: Query the NT object name (full path).
-        // -----------------------------------------------------------------------
-        ULONG nameRet = 0;
-        status = g_NtQueryObject(hDup, ObjectNameInformation,
-                                 nameBuf.data(), (ULONG)nameBuf.size(),
-                                 &nameRet);
-        if (!NT_SUCCESS(status) || nameRet < sizeof(BS_OBJECT_NAME_INFORMATION)) {
-            CloseHandle(hDup);
-            continue;
-        }
-        auto* nameInfo = reinterpret_cast<PBS_OBJECT_NAME_INFORMATION>(nameBuf.data());
-        if (!nameInfo->Name.Buffer || nameInfo->Name.Length == 0) {
-            CloseHandle(hDup);
-            continue;
-        }
+        // Resolve the path via GetFinalPathNameByHandleW — clean Win32, no
+        // NtQueryObject, no named-pipe stall risk.
+        wchar_t pathBuf[32768] = {};
+        DWORD n = GetFinalPathNameByHandleW(hDup, pathBuf, 32768, 0);
+        if (n == 0 || n >= 32768) { CloseHandle(hDup); continue; }
 
-        std::wstring objName(nameInfo->Name.Buffer,
-                             nameInfo->Name.Length / sizeof(wchar_t));
-        std::wstring objNameLow = objName;
-        std::transform(objNameLow.begin(), objNameLow.end(),
-                       objNameLow.begin(), ::towlower);
+        std::wstring handlePath(pathBuf, n);
+        // Strip \\?\ prefix that GetFinalPathNameByHandleW adds.
+        if (handlePath.size() > 4 && handlePath.substr(0, 4) == L"\\\\?\\")
+            handlePath = handlePath.substr(4);
 
-        CloseHandle(hDup); // done with the read copy
+        std::wstring handlePathLow = handlePath;
+        std::transform(handlePathLow.begin(), handlePathLow.end(),
+                       handlePathLow.begin(), ::towlower);
 
-        // -----------------------------------------------------------------------
-        // Step 6: Does this handle point to our target file?
-        //         Compare both the NT device path AND a bare filename suffix
-        //         in case the drive mapping didn't resolve.
-        // -----------------------------------------------------------------------
-        bool match = (objNameLow == ntPathLow);
-        if (!match) {
-            // Fallback: compare just the filename portion case-insensitively.
-            std::wstring targetFileLow = targetPath.filename().wstring();
-            std::transform(targetFileLow.begin(), targetFileLow.end(),
-                           targetFileLow.begin(), ::towlower);
-            // objName must END with \<filename> to count (not a partial match).
-            if (objNameLow.size() >= targetFileLow.size() + 1) {
-                size_t pos = objNameLow.size() - targetFileLow.size();
-                if (objNameLow[pos - 1] == L'\\' &&
-                    objNameLow.substr(pos) == targetFileLow) {
-                    match = true;
-                }
-            }
-        }
+        if (handlePathLow != target) { CloseHandle(hDup); continue; }
 
-        if (!match) continue;
-
-        // -----------------------------------------------------------------------
-        // Step 7: Close the handle in the owner process.
-        //         DuplicateHandle with DUPLICATE_CLOSE_SOURCE + NULL target
-        //         process closes the source and does not create a copy for us.
-        // -----------------------------------------------------------------------
-        HANDLE dummy = nullptr;
-        if (DuplicateHandle(hProc, (HANDLE)(ULONG_PTR)sh.Handle,
-                            GetCurrentProcess(), &dummy,
-                            0, FALSE,
-                            DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS)) {
-            // Close the copy that landed in our process.
-            if (dummy) CloseHandle(dummy);
-            ++closed;
-            Log("handle-unlock: closed handle 0x%X in PID %lu for %s",
-                sh.Handle, sh.ProcessId,
-                targetPath.filename().string().c_str());
-        }
+        // Found a matching readable handle — return it to the caller.
+        Log("handle-hijack: found matching handle from PID %lu for %s",
+            pid, targetPath.filename().string().c_str());
+        result = hDup;
     }
 
-    // Close cached process handles
-    for (auto& [pid, h] : procHandleCache)
-        if (h) CloseHandle(h);
-
-    return closed;
+    for (auto& [pid, h] : procCache) if (h) CloseHandle(h);
+    return result;
 }
 
-// Copies a single file, overwriting the destination.
+// Copy via hijack: duplicate the browser's handle and stream through it.
+static int64_t CopyFileViaHijack(const fs::path& src, const fs::path& dst,
+                                  const std::vector<DWORD>& lockingPids)
+{
+    HANDLE hDup = DuplicateLockedFileHandle(src, lockingPids);
+    if (hDup == INVALID_HANDLE_VALUE) return -1;
+
+    int64_t n = CopyThroughHandle(hDup, dst);
+    CloseHandle(hDup);
+    return n;
+}
+
+// Returns true for files we know Chrome holds locked before even trying a
+// normal open (GPUPersistentCache/*, cache.db).  Mirrors Go's shouldTryHijackBeforeCopy.
+static bool ShouldPreHijack(const fs::path& src) {
+    std::string lower = ToLower(src.string());
+    // Replace backslashes for uniform substring search
+    for (char& c : lower) if (c == '\\') c = '/';
+    return lower.find("/gpupersistentcache/") != std::string::npos
+        || lower.size() >= 8 && lower.substr(lower.size() - 8) == "/cache.db";
+}
+
+// ---------------------------------------------------------------------------
+// ForceCopyFile — primary copy routine
+// ---------------------------------------------------------------------------
+// Strategy (mirrors Go handle_hijack_windows.go):
+//   1. For a small set of known-always-locked files, go straight to hijack.
+//   2. Otherwise try a plain share-mode open first (fast path).
+//   3. If that fails with a sharing violation, ask Restart Manager which PIDs
+//      hold the lock, then hijack a readable duplicate from one of them.
+//   4. On error at any step, fall back to the next approach rather than
+//      immediately failing.
 //
-// Chrome (v104+) and Brave hold Cookies, Session_*, Tabs_*, cache.db* open
-// with dwShareMode=0 — a full exclusive deny-all lock.  No share flags on our
-// CreateFileW call can override the first opener's lock.
-//
-// When running as admin, the SeBackupPrivilege path (FILE_FLAG_BACKUP_SEMANTICS)
-// bypasses the share-mode check entirely and we never need to touch the browser's
-// handles.
-//
-// When NOT running as admin, SeBackupPrivilege cannot be enabled, so we fall
-// back to the handle-duplication unlock: enumerate all open handles via
-// NtQuerySystemInformation, find every handle pointing to this file, and
-// close each one in its owner process via DuplicateHandle(DUPLICATE_CLOSE_SOURCE).
-// After that the file is no longer locked and a plain CreateFile succeeds.
+// We NEVER close the browser's handle — we only read through our own
+// duplicate.  The browser continues running without interruption.
 //
 // Returns bytes copied on success, -1 on error.
 static int64_t ForceCopyFile(const fs::path& src, const fs::path& dst) {
-    // FILE_FLAG_BACKUP_SEMANTICS: requests backup-intent open, which combined
-    // with SeBackupPrivilege bypasses both DACL and share-mode checks.
-    // FILE_FLAG_SEQUENTIAL_SCAN: hints the prefetcher for linear reads.
+    // --- Fast path for known-locked files: hijack before even trying ---
+    if (ShouldPreHijack(src)) {
+        std::vector<DWORD> pids = GetLockingPIDs(src.wstring());
+        int64_t n = CopyFileViaHijack(src, dst, pids);
+        if (n >= 0) return n;
+        Log("handle-hijack: pre-copy hijack failed for %s; trying normal copy",
+            src.filename().string().c_str());
+    }
+
+    // --- Normal open (works for unlocked or admin-elevated files) ---
     HANDLE hSrc = CreateFileW(
-        src.c_str(),
-        GENERIC_READ,
+        src.c_str(), GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_SEQUENTIAL_SCAN,
-        nullptr);
+        nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
 
-    if (hSrc == INVALID_HANDLE_VALUE) {
-        // Backup-semantics open failed (no SeBackupPrivilege / not admin).
-        // Handle-unlock was already done in bulk before the parallel copy
-        // started (UnlockAllProfileHandles), so the lock should be gone.
-        // Plain copy_file is the fallback for any file that is still held
-        // or simply needs no special treatment.
-        try {
-            fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
-            return (int64_t)fs::file_size(dst);
-        } catch (...) {
-            return -1;
-        }
-    }
-
-    LARGE_INTEGER fileSize{};
-    GetFileSizeEx(hSrc, &fileSize);
-
-    HANDLE hDst = CreateFileW(
-        dst.c_str(),
-        GENERIC_WRITE,
-        FILE_SHARE_READ,
-        nullptr,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-        nullptr);
-
-    if (hDst == INVALID_HANDLE_VALUE) {
+    if (hSrc != INVALID_HANDLE_VALUE) {
+        int64_t n = CopyThroughHandle(hSrc, dst);
         CloseHandle(hSrc);
-        return -1;
+        return n;
     }
 
-    static constexpr DWORD kBufSize = 1 << 20; // 1 MB read chunks
-    std::vector<char> buf(kBufSize);
-    int64_t totalWritten = 0;
-    bool ok = true;
+    // --- Sharing violation: identify lockers and hijack ---
+    if (!IsFileLocked(GetLastError())) return -1;
 
-    while (ok) {
-        DWORD bytesRead = 0;
-        if (!ReadFile(hSrc, buf.data(), kBufSize, &bytesRead, nullptr)) { ok = false; break; }
-        if (bytesRead == 0) break; // EOF
-
-        DWORD bytesWritten = 0;
-        if (!WriteFile(hDst, buf.data(), bytesRead, &bytesWritten, nullptr) ||
-            bytesWritten != bytesRead) {
-            ok = false; break;
-        }
-        totalWritten += bytesWritten;
+    std::vector<DWORD> lockingPids = GetLockingPIDs(src.wstring());
+    int64_t n = CopyFileViaHijack(src, dst, lockingPids);
+    if (n < 0) {
+        Log("handle-hijack: locked-file hijack failed for %s",
+            src.filename().string().c_str());
     }
-
-    CloseHandle(hSrc);
-    CloseHandle(hDst);
-
-    if (!ok) {
-        DeleteFileW(dst.c_str());
-        return -1;
-    }
-    return totalWritten;
+    return n;
 }
 
 static const std::set<std::string> BASE_SKIP_DIRS = {
@@ -667,11 +614,6 @@ struct CopyJob {
     fs::path dst;
     int64_t  size;
 };
-
-static std::string ToLower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-    return s;
-}
 
 // Collect all copyable files from a profile-like directory tree.
 static void CollectProfileDir(
@@ -724,46 +666,7 @@ static void CollectDirFiles(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bulk handle unlock — called ONCE before the parallel copy workers start.
-//
-// UnlockFileHandles() does a full system-wide NtQuerySystemInformation pass.
-// Calling it from 16 worker threads simultaneously causes severe kernel-level
-// contention (every thread races to DuplicateHandle into/out of the same
-// remote processes) and stalls all workers indefinitely, deadlocking the
-// doneCv.wait in CloneBrowserProfile.
-//
-// The correct pattern is a single serial pass over all collected copy jobs
-// before the thread pool starts.  We build the set of unique source paths
-// that fail a quick open attempt (i.e. are actually exclusively locked), then
-// call UnlockFileHandles once per locked file.  After this function returns
-// every job should be openable by a plain CreateFileW.
-// ---------------------------------------------------------------------------
-static void UnlockAllProfileHandles(const std::vector<CopyJob>& jobs) {
-    for (const auto& job : jobs) {
-        // Quick probe: try to open with the same flags ForceCopyFile uses.
-        // If it succeeds the file is not exclusively locked — skip it.
-        HANDLE h = CreateFileW(
-            job.src.c_str(),
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr,
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_SEQUENTIAL_SCAN,
-            nullptr);
-        if (h != INVALID_HANDLE_VALUE) {
-            CloseHandle(h);
-            continue; // not locked
-        }
 
-        // File is locked — close all handles pointing to it.
-        int n = UnlockFileHandles(job.src);
-        if (n > 0) {
-            Log("handle-unlock: released %d handle(s) on %s",
-                n, job.src.filename().string().c_str());
-        }
-    }
-}
 
 // Full profile clone. Returns the clone directory, or empty on error.
 static std::string CloneBrowserProfile(
@@ -841,30 +744,19 @@ static std::string CloneBrowserProfile(
     for (auto& d : dirs) fs::create_directories(d, ec);
 
     // ---------------------------------------------------------------------------
-    // Pre-unlock: single serial pass to release exclusive handles BEFORE the
-    // parallel workers start.  Doing this inside ForceCopyFile (called from
-    // 16 threads simultaneously) causes kernel-level handle-table contention
-    // that stalls all workers and deadlocks the doneCv.wait below.
-    // ---------------------------------------------------------------------------
-    UnlockAllProfileHandles(jobs);
-
-    // ---------------------------------------------------------------------------
-    // Parallel copy: thread pool — saturates NVMe queue depth for small files.
-    // 16 workers is the sweet spot for a local SSD with thousands of KB-range
-    // files; the OS I/O scheduler merges requests efficiently at this concurrency.
+    // Parallel copy: thread pool with per-file on-demand handle hijack.
+    //
+    // Worker count matches the Go reference (2 workers).  ForceCopyFile handles
+    // locked files inline: normal open first, then Restart Manager + handle
+    // hijack on sharing violation.  No bulk pre-unlock pass needed.
     //
     // Design notes:
     //   - `pending` is initialised to jobs.size() before any thread starts.
-    //     Each worker decrements it after finishing a job and signals doneCv
-    //     when it hits zero.  This means doneCv fires correctly even if all
-    //     work completes before the main thread reaches its wait().
-    //   - Workers are spawned AFTER queueCv.notify_all() has been called and
-    //     after the shutdown flag / queue are fully initialised, eliminating
-    //     the race where a worker calls wait() after the only notify_all().
-    //   - shutdown is set to true before the final notify_all() so workers
-    //     that wake up and find an empty queue exit cleanly.
+    //   - Workers are spawned AFTER all state is initialised so no worker
+    //     can call queueCv.wait() before notify_all() fires.
+    //   - shutdown is set before the final notify_all() so workers exit.
     // ---------------------------------------------------------------------------
-    static constexpr int kWorkers = 16;
+    static constexpr int kWorkers = 2;
 
     std::queue<const CopyJob*> workQueue;
     std::mutex                 queueMu;
@@ -890,13 +782,11 @@ static std::string CloneBrowserProfile(
                 workQueue.pop();
             }
 
-            // 3 attempts, 200 ms between retries.
-            // Locked-file errors are handled by the pre-unlock pass;
-            // retries here cover only transient I/O failures.
+            // 3 attempts, 750 ms between retries (matches Go reference).
             bool ok = false;
             for (int attempt = 0; attempt < 3; ++attempt) {
                 if (attempt > 0)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(750));
                 if (ForceCopyFile(job->src, job->dst) >= 0) { ok = true; break; }
             }
             if (!ok) {
