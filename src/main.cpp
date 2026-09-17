@@ -18,6 +18,7 @@
 
 // WIN32_LEAN_AND_MEAN and NOMINMAX are passed on the compiler command line.
 #include <windows.h>
+#include <winternl.h>  // NTSTATUS, NTAPI — excluded by WIN32_LEAN_AND_MEAN otherwise
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <shlobj.h>
