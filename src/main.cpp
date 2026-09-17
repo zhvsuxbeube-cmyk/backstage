@@ -757,33 +757,31 @@ static std::string CloneBrowserProfile(
     //     can call queueCv.wait() before notify_all() fires.
     //   - shutdown is set before the final notify_all() so workers exit.
     // ---------------------------------------------------------------------------
+    // Mirrors Go: jobCh <- job ... close(jobCh) ... wg.Wait()
+    // A mutex-protected deque stands in for Go's buffered channel.
     static constexpr int kWorkers = 2;
 
-    std::queue<const CopyJob*> workQueue;
-    std::mutex                 queueMu;
-    std::condition_variable    queueCv;  // wakes workers when jobs arrive / shutdown
-    std::condition_variable    doneCv;   // wakes main when all work is finished
-    std::atomic<int64_t>       failedCount{0};
-    // `pending` counts jobs not yet completed (popped AND processed).
-    // Initialised to total job count so doneCv fires correctly even if all
-    // work finishes before main reaches its wait().
-    size_t                     pending = jobs.size();
-    bool                       shutdown = false;
+    std::mutex              queueMu;
+    std::condition_variable queueCv;
+    std::deque<const CopyJob*> jobCh;
+    std::atomic<int64_t>    failedCount{0};
 
-    for (auto& j : jobs) workQueue.push(&j);
+    // Feed all jobs, then push one nullptr sentinel per worker (mirrors close(jobCh)).
+    for (auto& j : jobs) jobCh.push_back(&j);
+    for (int i = 0; i < kWorkers; ++i) jobCh.push_back(nullptr);
 
     auto worker = [&]() {
         for (;;) {
             const CopyJob* job = nullptr;
             {
                 std::unique_lock<std::mutex> lk(queueMu);
-                queueCv.wait(lk, [&]{ return !workQueue.empty() || shutdown; });
-                if (workQueue.empty()) return; // shutdown && empty → exit
-                job = workQueue.front();
-                workQueue.pop();
+                queueCv.wait(lk, [&]{ return !jobCh.empty(); });
+                job = jobCh.front();
+                jobCh.pop_front();
             }
+            if (!job) return; // nullptr sentinel = channel closed, exit
 
-            // 3 attempts, 750 ms between retries (matches Go reference).
+            // 3 attempts, 750 ms between retries (matches Go cloneCopyMaxAttempts).
             bool ok = false;
             for (int attempt = 0; attempt < 3; ++attempt) {
                 if (attempt > 0)
@@ -795,37 +793,18 @@ static std::string CloneBrowserProfile(
                 Log("warning: could not copy %s after retries",
                     job->src.filename().string().c_str());
             }
-
-            {
-                std::unique_lock<std::mutex> lk(queueMu);
-                if (--pending == 0)
-                    doneCv.notify_one(); // all jobs done — wake main thread
-            }
         }
     };
 
-    // Spawn workers. All state (queue, flags) is fully initialised before
-    // threads start, so there is no window where a worker can miss a signal.
     std::vector<std::thread> threads;
     threads.reserve(kWorkers);
     for (int i = 0; i < kWorkers; ++i)
         threads.emplace_back(worker);
 
-    // Wake all workers now that threads exist and are listening.
+    // Jobs + sentinels already queued — wake workers immediately.
     queueCv.notify_all();
 
-    // Wait until every job has been completed (pending == 0).
-    if (!jobs.empty()) {
-        std::unique_lock<std::mutex> lk(queueMu);
-        doneCv.wait(lk, [&]{ return pending == 0; });
-    }
-
-    // Signal workers to exit and join them.
-    {
-        std::unique_lock<std::mutex> lk(queueMu);
-        shutdown = true;
-    }
-    queueCv.notify_all();
+    // wg.Wait() equivalent — join all workers.
     for (auto& t : threads) t.join();
 
     int64_t failed = failedCount.load();
@@ -1422,6 +1401,88 @@ static DWORD StartProcessInjected(
 }
 
 // ---------------------------------------------------------------------------
+// Process crash monitor (mirrors Go monitorProcessCrash)
+// ---------------------------------------------------------------------------
+// Launched as a background thread after process resume.
+// Waits up to 20 s; if the process exits within that window it logs why.
+// Exit codes 17 and 21 mean Chromium handed off to an already-running
+// instance — that is informational, not a crash.
+
+static std::string DescribeExitCode(DWORD code) {
+    switch (code) {
+    case 0:           return "normal exit";
+    case 0xC0000005:  return "access violation (0xC0000005)";
+    case 0xC0000374:  return "heap corruption (0xC0000374)";
+    case 0xC0000409:  return "stack buffer overrun (0xC0000409)";
+    case 0xC000001D:  return "illegal instruction (0xC000001D)";
+    case 0xC00000FD:  return "stack overflow (0xC00000FD)";
+    case 0xC0000096:  return "privileged instruction (0xC0000096)";
+    case 0x40010004:  return "debugger terminated process";
+    case 0xC000013A:  return "process killed by Ctrl+C";
+    case 1:           return "general error (exit code 1)";
+    case 21:          return "exit code 0x15 (21) — another instance already running";
+    case 17:          return "exit code 0x11 (17) — handed off to existing instance";
+    default: {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "exit code 0x%X (%lu)", code, code);
+        return buf;
+    }
+    }
+}
+
+static void MonitorProcessCrash(
+    DWORD pid,
+    const std::string& label,
+    std::function<void(const char*, bool, const char*)> notify)
+{
+    HANDLE hProc = OpenProcess(
+        SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProc) return;
+
+    DWORD waitRet = WaitForSingleObject(hProc, 20000);
+    if (waitRet != WAIT_OBJECT_0) {
+        // Still running after 20 s — healthy
+        char msg[128];
+        snprintf(msg, sizeof(msg), "%s (PID %lu) still running after 20s",
+                 label.c_str(), pid);
+        notify("healthy", true, msg);
+        CloseHandle(hProc);
+        return;
+    }
+
+    DWORD exitCode = 0;
+    GetExitCodeProcess(hProc, &exitCode);
+    CloseHandle(hProc);
+
+    std::string desc = DescribeExitCode(exitCode);
+
+    if (exitCode == 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "%s (PID %lu) exited immediately — %s",
+                 label.c_str(), pid, desc.c_str());
+        notify("exited", false, msg);
+        return;
+    }
+
+    // Chromium single-instance handoff — informational, not a crash.
+    std::string labelLow = ToLower(label);
+    if ((exitCode == 17 || exitCode == 21) &&
+        labelLow.find("chrome") != std::string::npos) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "%s (PID %lu) handed off to existing instance — %s",
+                 label.c_str(), pid, desc.c_str());
+        notify("handoff", true, msg);
+        return;
+    }
+
+    char msg[256];
+    snprintf(msg, sizeof(msg), "%s (PID %lu) crashed — %s",
+             label.c_str(), pid, desc.c_str());
+    notify("crashed", false, msg);
+}
+
+// ---------------------------------------------------------------------------
 // Top-level browser launcher (mirrors Go StartbackstageBrowserInjected)
 // ---------------------------------------------------------------------------
 
@@ -1454,6 +1515,10 @@ static bool LaunchBrowser(
         if (!pid) { notify("launch", false, "CreateProcess failed"); return false; }
         char msg[64]; snprintf(msg, sizeof(msg), "PID %lu", pid);
         notify("launch", true, msg);
+        // Async crash monitor — mirrors Go goroutine monitorProcessCrash.
+        std::thread([pid, name = info.name, notify]() {
+            MonitorProcessCrash(pid, name, notify);
+        }).detach();
         return true;
     }
 
@@ -1484,6 +1549,10 @@ static bool LaunchBrowser(
     if (!pid) { notify("launch", false, "CreateProcess failed"); return false; }
     char msg[64]; snprintf(msg, sizeof(msg), "PID %lu", pid);
     notify("launch", true, msg);
+    // Async crash monitor — mirrors Go goroutine monitorProcessCrash.
+    std::thread([pid, name = info.name, notify]() {
+        MonitorProcessCrash(pid, name, notify);
+    }).detach();
     return true;
 }
 
